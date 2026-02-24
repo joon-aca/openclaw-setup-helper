@@ -17,7 +17,6 @@ umask 077
 #   OPENCLAW_PORT="18789"
 #   SKIP_TAILSCALE=0               # set 1 to skip tailscale entirely
 #   SKIP_BREW=0                    # set 1 to skip homebrew + skill deps
-#   RUN_WIZARD=0                   # set 1 to run openclaw onboard at end
 ############################################
 
 log()  { printf "\n\033[1m==> %s\033[0m\n" "$*"; }
@@ -29,10 +28,53 @@ TAILSCALE_HOSTNAME="${TAILSCALE_HOSTNAME:-lando}"
 TAILSCALE_AUTHKEY="${TAILSCALE_AUTHKEY:-}"
 SKIP_TAILSCALE="${SKIP_TAILSCALE:-0}"
 SKIP_BREW="${SKIP_BREW:-0}"
-RUN_WIZARD="${RUN_WIZARD:-0}"
 
 STATE_DIR="$HOME/.openclaw"
 ENV_FILE="$STATE_DIR/.env"
+
+############################################
+# Ensure we're running from an OpenClaw dir
+############################################
+is_openclaw_dir() {
+  [[ -f "$1/package.json" ]] && grep -q '"openclaw"' "$1/package.json" 2>/dev/null
+}
+
+ensure_openclaw_dir() {
+  local script_path
+  script_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+  local script_dir
+  script_dir="$(dirname "$script_path")"
+
+  if is_openclaw_dir "$script_dir"; then
+    return 0
+  fi
+
+  if [[ ! -t 0 ]]; then
+    die "Not running from an OpenClaw directory. Re-run from your OpenClaw checkout."
+  fi
+
+  echo
+  echo "This script isn't inside an OpenClaw directory."
+  echo "Where is your OpenClaw checkout? (relative or absolute path)"
+  printf "> "
+  local oc_dir=""
+  IFS= read -r oc_dir
+
+  oc_dir="$(cd "$oc_dir" 2>/dev/null && pwd)" || die "Directory not found: $oc_dir"
+
+  if ! is_openclaw_dir "$oc_dir"; then
+    die "$oc_dir doesn't look like an OpenClaw checkout"
+  fi
+
+  local link_path="$oc_dir/$(basename "$script_path")"
+  if [[ -e "$link_path" && ! -L "$link_path" ]]; then
+    die "$link_path already exists and is not a symlink"
+  fi
+  ln -sf "$script_path" "$link_path"
+  log "Linked into $oc_dir — re-executing from there"
+
+  exec "$link_path" "$@"
+}
 
 sudo_if_needed() {
   if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then sudo "$@"; else "$@"; fi
@@ -62,20 +104,18 @@ write_env_kv() {
 ############################################
 # Interactive prompts — all upfront
 ############################################
+mask_value() {
+  local v="$1"
+  local len=${#v}
+  if [[ $len -le 8 ]]; then
+    printf '%s' "${v:0:2}***"
+  else
+    printf '%s' "${v:0:4}...${v: -4}"
+  fi
+}
+
 ask_secret() {
   local var="$1" label="$2" url="$3"
-
-  # Already in env file? Skip.
-  if grep -qE "^${var}=" "$ENV_FILE" 2>/dev/null; then
-    log "$var already set in $ENV_FILE — skipping"
-    return 0
-  fi
-
-  # Already exported? Persist and skip.
-  if [[ -n "${!var:-}" ]]; then
-    write_env_kv "$var" "${!var}"
-    return 0
-  fi
 
   # No TTY? Can't prompt.
   if [[ ! -t 0 ]]; then
@@ -83,18 +123,47 @@ ask_secret() {
     return 0
   fi
 
+  # Check for existing value (env file first, then exported env)
+  local existing=""
+  if grep -qE "^${var}=" "$ENV_FILE" 2>/dev/null; then
+    existing="$(grep -E "^${var}=" "$ENV_FILE" | head -1)"
+    existing="${existing#*=}"
+  elif [[ -n "${!var:-}" ]]; then
+    existing="${!var}"
+  fi
+
   echo
   echo "------------------------------------------------------------"
   echo "$label"
   echo "  $url"
-  echo "Paste value (Enter to skip):"
+
+  if [[ -n "$existing" ]]; then
+    echo "Current: $(mask_value "$existing")"
+    echo "Enter to keep, paste new value to replace, or 'clear' to remove:"
+  else
+    echo "Paste value (Enter to skip):"
+  fi
   printf "> "
   local val=""
   IFS= read -r -s val
   printf "\n"
 
   if [[ -z "$val" ]]; then
-    warn "Skipped $var"
+    if [[ -n "$existing" ]]; then
+      # Keep existing — make sure it's persisted to env file
+      write_env_kv "$var" "$existing"
+    else
+      warn "Skipped $var"
+    fi
+    return 0
+  fi
+
+  if [[ "$val" == "clear" ]]; then
+    # Remove from env file
+    if [[ -f "$ENV_FILE" ]]; then
+      sed -i "/^${var}=/d" "$ENV_FILE"
+    fi
+    warn "Cleared $var"
     return 0
   fi
 
@@ -105,8 +174,8 @@ collect_secrets() {
   log "Collecting secrets (all prompts now, installs after)"
 
   ask_secret "BRAVE_API_KEY" \
-    "Brave Search API key (enables web_search)" \
-    "https://docs.openclaw.ai/tools/web"
+    "Brave Search API key (enables web_search, \$5/mo)" \
+    "https://docs.openclaw.ai/brave-search"
 
   ask_secret "TELEGRAM_BOT_TOKEN" \
     "Telegram bot token (from @BotFather)" \
@@ -227,6 +296,11 @@ install_openclaw() {
     log "openclaw already installed"
     return 0
   fi
+  # Also catch source checkouts (e.g. /opt/openclaw) that aren't in PATH yet
+  if [[ -d /opt/openclaw ]]; then
+    log "openclaw source checkout found at /opt/openclaw — skipping install"
+    return 0
+  fi
   log "Installing OpenClaw"
   curl -fsSL https://openclaw.ai/install.sh | bash -s -- --no-onboard
   command -v openclaw >/dev/null 2>&1 || die "openclaw install failed"
@@ -259,31 +333,16 @@ apply_config() {
   openclaw config set tools.web.fetch.enabled true
 }
 
-start_gateway() {
-  log "Installing/starting gateway service"
-
-  # Source env so the gateway install picks up the token
-  set -a
-  # shellcheck disable=SC1090
-  source "$ENV_FILE"
-  set +a
-
-  openclaw gateway install \
-    --port "$OPENCLAW_PORT" \
-    --runtime node \
-    --token "$OPENCLAW_GATEWAY_TOKEN" \
-    --force
-
-  openclaw gateway restart || openclaw gateway start || true
-  openclaw gateway status || true
-}
-
 ############################################
 # Main — sequenced to avoid hangs
 ############################################
 main() {
-  log "Installing base packages"
-  apt_install curl ca-certificates jq openssl git
+  ensure_openclaw_dir "$@"
+
+  log "Checking prerequisites"
+  for cmd in curl jq openssl git; do
+    command -v "$cmd" >/dev/null 2>&1 || die "Missing required command: $cmd"
+  done
 
   ensure_files
 
@@ -295,32 +354,23 @@ main() {
   setup_tailscale
   setup_brew
 
-  # ── Phase 3: non-interactive config + start ──
+  # ── Phase 3: non-interactive config ──
   ensure_gateway_token
   apply_config
 
   log "Enabling systemd lingering"
   sudo_if_needed loginctl enable-linger "$USER"
 
-  start_gateway
-
   log "Running doctor"
   openclaw doctor || true
 
-  # ── Phase 4: optional wizard ──
-  if [[ "$RUN_WIZARD" == "1" ]]; then
-    log "Launching wizard with env loaded"
-    set -a
-    # shellcheck disable=SC1090
-    source "$ENV_FILE"
-    set +a
-    openclaw onboard --install-daemon
-  else
-    echo
-    echo "Setup complete. To run the interactive wizard:"
-    echo "  set -a; source ~/.openclaw/.env; set +a; openclaw configure"
-    echo
-  fi
+  # ── Phase 4: wizard (installs + starts the gateway daemon) ──
+  log "Launching onboarding wizard"
+  set -a
+  # shellcheck disable=SC1090
+  source "$ENV_FILE"
+  set +a
+  openclaw onboard --install-daemon
 }
 
 main "$@"
