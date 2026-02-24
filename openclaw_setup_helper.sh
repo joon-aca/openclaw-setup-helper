@@ -150,24 +150,24 @@ ask_secret() {
 
   if [[ -z "$val" ]]; then
     if [[ -n "$existing" ]]; then
-      # Keep existing — make sure it's persisted to env file
       write_env_kv "$var" "$existing"
+      echo "  ✓ Kept existing $var"
     else
-      warn "Skipped $var"
+      echo "  – Skipped $var"
     fi
     return 0
   fi
 
   if [[ "$val" == "clear" ]]; then
-    # Remove from env file
     if [[ -f "$ENV_FILE" ]]; then
       sed -i "/^${var}=/d" "$ENV_FILE"
     fi
-    warn "Cleared $var"
+    echo "  ✗ Cleared $var"
     return 0
   fi
 
   write_env_kv "$var" "$val"
+  echo "  ✓ Saved $var ($(mask_value "$val"))"
 }
 
 collect_secrets() {
