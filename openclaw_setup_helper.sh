@@ -316,6 +316,10 @@ install_openclaw() {
     log "openclaw already installed: $(command -v openclaw)"
     return 0
   fi
+  # Source checkout present but not built/linked — tell the user to build it
+  if [[ -d /opt/openclaw ]]; then
+    die "openclaw source checkout found at /opt/openclaw but 'openclaw' is not in PATH. Run 'pnpm build' in the repo and ensure openclaw is on your PATH, then re-run this script."
+  fi
   log "Installing OpenClaw"
   curl -fsSL https://openclaw.ai/install.sh | bash -s -- --no-onboard
   command -v openclaw >/dev/null 2>&1 || die "openclaw install failed"
