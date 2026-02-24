@@ -3,15 +3,15 @@ set -euo pipefail
 umask 077
 
 ############################################
-# openclaw_setup.sh (Ubuntu server)
+# openclaw_setup_helper.sh
 #
-# Collects all secrets interactively FIRST,
-# then runs installs + config non-interactively.
+# Helper for setting up an OpenClaw deployment.
+# Collects secrets, configures the gateway,
+# then launches the onboarding wizard.
 #
-# Outputs:
-#   ~/.openclaw/.env          (secrets + gateway token)
+# Stores secrets in: ~/.openclaw/.env
 #
-# Optional env knobs:
+# Env knobs:
 #   TAILSCALE_AUTHKEY="tskey-..."   # skip interactive tailscale login
 #   TAILSCALE_HOSTNAME="lando"
 #   OPENCLAW_PORT="18789"
@@ -95,10 +95,33 @@ write_env_kv() {
   local k="$1" v="${2:-}"
   [[ -z "$v" ]] && return 0
   if grep -qE "^${k}=" "$ENV_FILE" 2>/dev/null; then
-    sed -i "s#^${k}=.*#${k}=${v}#g" "$ENV_FILE"
+    # Replace in-place via temp file (avoids sed delimiter issues with special chars)
+    local tmp
+    tmp="$(mktemp)"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      if [[ "$line" == "${k}="* ]]; then
+        printf '%s=%s\n' "$k" "$v"
+      else
+        printf '%s\n' "$line"
+      fi
+    done < "$ENV_FILE" > "$tmp"
+    mv "$tmp" "$ENV_FILE"
+    chmod 600 "$ENV_FILE"
   else
     printf "%s=%s\n" "$k" "$v" >> "$ENV_FILE"
   fi
+}
+
+remove_env_kv() {
+  local k="$1"
+  [[ -f "$ENV_FILE" ]] || return 0
+  local tmp
+  tmp="$(mktemp)"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "$line" == "${k}="* ]] || printf '%s\n' "$line"
+  done < "$ENV_FILE" > "$tmp"
+  mv "$tmp" "$ENV_FILE"
+  chmod 600 "$ENV_FILE"
 }
 
 ############################################
@@ -159,9 +182,7 @@ ask_secret() {
   fi
 
   if [[ "$val" == "clear" ]]; then
-    if [[ -f "$ENV_FILE" ]]; then
-      sed -i "/^${var}=/d" "$ENV_FILE"
-    fi
+    remove_env_kv "$var"
     echo "  ✗ Cleared $var"
     return 0
   fi
@@ -171,7 +192,7 @@ ask_secret() {
 }
 
 collect_secrets() {
-  log "Collecting secrets (all prompts now, installs after)"
+  log "Configuring API keys"
 
   ask_secret "BRAVE_API_KEY" \
     "Brave Search API key (enables web_search, \$5/mo)" \
@@ -266,11 +287,10 @@ setup_brew() {
   # Wire into PATH for this session
   eval "$("$brew_bin" shellenv)"
 
-  # Persist across logins
+  # Persist across logins (only touch RC files that already exist)
   local brew_eval="eval \"\$($brew_bin shellenv)\""
   for rc in "$HOME/.zprofile" "$HOME/.zshrc" "$HOME/.profile" "$HOME/.bashrc"; do
-    mkdir -p "$(dirname "$rc")"
-    touch "$rc"
+    [[ -f "$rc" ]] || continue
     grep -Fqs "$brew_eval" "$rc" || printf "\n%s\n" "$brew_eval" >> "$rc"
   done
 
@@ -293,12 +313,7 @@ setup_brew() {
 ############################################
 install_openclaw() {
   if command -v openclaw >/dev/null 2>&1; then
-    log "openclaw already installed"
-    return 0
-  fi
-  # Also catch source checkouts (e.g. /opt/openclaw) that aren't in PATH yet
-  if [[ -d /opt/openclaw ]]; then
-    log "openclaw source checkout found at /opt/openclaw — skipping install"
+    log "openclaw already installed: $(command -v openclaw)"
     return 0
   fi
   log "Installing OpenClaw"
@@ -340,9 +355,16 @@ main() {
   ensure_openclaw_dir "$@"
 
   log "Checking prerequisites"
+  local missing=()
   for cmd in curl jq openssl git; do
-    command -v "$cmd" >/dev/null 2>&1 || die "Missing required command: $cmd"
+    if command -v "$cmd" >/dev/null 2>&1; then
+      echo "  ✓ $cmd"
+    else
+      echo "  ✗ $cmd (not found)"
+      missing+=("$cmd")
+    fi
   done
+  [[ ${#missing[@]} -eq 0 ]] || die "Missing required commands: ${missing[*]}"
 
   ensure_files
 
@@ -371,6 +393,16 @@ main() {
   source "$ENV_FILE"
   set +a
   openclaw onboard --install-daemon
+
+  echo
+  echo "============================================================"
+  echo "  Setup complete!"
+  echo ""
+  echo "  Secrets:  $ENV_FILE"
+  echo "  Config:   openclaw config list"
+  echo "  Status:   openclaw doctor"
+  echo "  Gateway:  openclaw gateway status"
+  echo "============================================================"
 }
 
 main "$@"
